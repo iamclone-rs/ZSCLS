@@ -98,19 +98,43 @@ def load_checkpoint(fpath):
 
     map_location = None if torch.cuda.is_available() else "cpu"
 
+    def _torch_load(path, pickle_module=None, force_full_pickle=False):
+        kwargs = {"map_location": map_location}
+        if pickle_module is not None:
+            kwargs["pickle_module"] = pickle_module
+
+        # PyTorch 2.6+ defaults `weights_only=True`, which breaks older
+        # Dassl checkpoints containing optimizer/scheduler states.
+        if force_full_pickle:
+            kwargs["weights_only"] = False
+
+        return torch.load(path, **kwargs)
+
     try:
-        checkpoint = torch.load(fpath, map_location=map_location)
+        checkpoint = _torch_load(fpath)
 
     except UnicodeDecodeError:
         pickle.load = partial(pickle.load, encoding="latin1")
         pickle.Unpickler = partial(pickle.Unpickler, encoding="latin1")
-        checkpoint = torch.load(
-            fpath, pickle_module=pickle, map_location=map_location
-        )
+        try:
+            checkpoint = _torch_load(fpath, pickle_module=pickle)
+        except Exception as e:
+            if "Weights only load failed" not in str(e):
+                raise
+            checkpoint = _torch_load(
+                fpath, pickle_module=pickle, force_full_pickle=True
+            )
 
-    except Exception:
-        print('Unable to load checkpoint from "{}"'.format(fpath))
-        raise
+    except Exception as e:
+        if "Weights only load failed" not in str(e):
+            print('Unable to load checkpoint from "{}"'.format(fpath))
+            raise
+
+        try:
+            checkpoint = _torch_load(fpath, force_full_pickle=True)
+        except Exception:
+            print('Unable to load checkpoint from "{}"'.format(fpath))
+            raise
 
     return checkpoint
 
