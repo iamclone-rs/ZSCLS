@@ -34,7 +34,12 @@ class OxfordFlowers(DatasetBase):
         num_shots = cfg.DATASET.NUM_SHOTS
         if num_shots >= 1:
             seed = cfg.SEED
-            preprocessed = os.path.join(self.split_fewshot_dir, f"shot_{num_shots}-seed_{seed}.pkl")
+            preprocessed = self.get_fewshot_cache_path(
+                self.split_fewshot_dir,
+                num_shots,
+                seed,
+                full_val=cfg.DATASET.FULL_VAL,
+            )
             
             if os.path.exists(preprocessed):
                 print(f"Loading preprocessed few-shot data from {preprocessed}")
@@ -42,8 +47,12 @@ class OxfordFlowers(DatasetBase):
                     data = pickle.load(file)
                     train, val = data["train"], data["val"]
             else:
-                train = self.generate_fewshot_dataset(train, num_shots=num_shots)
-                val = self.generate_fewshot_dataset(val, num_shots=min(num_shots, 4))
+                train, val = self.generate_fewshot_trainval(
+                    train,
+                    val,
+                    num_shots,
+                    full_val=cfg.DATASET.FULL_VAL,
+                )
                 data = {"train": train, "val": val}
                 print(f"Saving preprocessed few-shot data to {preprocessed}")
                 with open(preprocessed, "wb") as file:

@@ -208,6 +208,21 @@ class DatasetBase:
 
         return output
 
+    def get_fewshot_cache_path(self, split_fewshot_dir, num_shots, seed, full_val=False):
+        val_tag = "fullval" if full_val else "val4"
+        filename = f"shot_{num_shots}-seed_{seed}-{val_tag}.pkl"
+        return osp.join(split_fewshot_dir, filename)
+
+    def generate_fewshot_trainval(self, train, val, num_shots, full_val=False):
+        train = self.generate_fewshot_dataset(train, num_shots=num_shots)
+
+        if full_val:
+            print("Using the full validation set")
+        else:
+            val = self.generate_fewshot_dataset(val, num_shots=min(num_shots, 4))
+
+        return train, val
+
     def split_dataset_by_label(self, data_source):
         """Split a dataset, i.e. a list of Datum objects,
         into class-specific groups stored in a dictionary.

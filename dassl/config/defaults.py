@@ -74,6 +74,9 @@ _C.DATASET.TARGET_DOMAINS = ()
 _C.DATASET.NUM_LABELED = -1
 # Number of images per class
 _C.DATASET.NUM_SHOTS = -1
+# For few-shot datasets, use the full validation set instead of the
+# legacy sampled validation subset (which uses up to 4 images per class).
+_C.DATASET.FULL_VAL = False
 # Percentage of validation data (only used for SSL datasets)
 # Set to 0 if do not want to use val data
 # Using val data for hyperparameter tuning was done in Oliver et al. 2018
