@@ -98,13 +98,19 @@ def load_checkpoint(fpath):
 
     map_location = None if torch.cuda.is_available() else "cpu"
 
+    def _torch_load_checkpoint(*args, **kwargs):
+        try:
+            return torch.load(*args, weights_only=False, **kwargs)
+        except TypeError:
+            return torch.load(*args, **kwargs)
+
     try:
-        checkpoint = torch.load(fpath, map_location=map_location)
+        checkpoint = _torch_load_checkpoint(fpath, map_location=map_location)
 
     except UnicodeDecodeError:
         pickle.load = partial(pickle.load, encoding="latin1")
         pickle.Unpickler = partial(pickle.Unpickler, encoding="latin1")
-        checkpoint = torch.load(
+        checkpoint = _torch_load_checkpoint(
             fpath, pickle_module=pickle, map_location=map_location
         )
 
