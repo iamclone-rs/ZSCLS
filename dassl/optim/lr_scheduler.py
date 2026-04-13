@@ -2,12 +2,15 @@
 Modified from https://github.com/KaiyangZhou/deep-person-reid
 """
 import torch
-from torch.optim.lr_scheduler import _LRScheduler
+try:
+    from torch.optim.lr_scheduler import LRScheduler as TorchLRScheduler
+except ImportError:
+    from torch.optim.lr_scheduler import _LRScheduler as TorchLRScheduler
 
 AVAI_SCHEDS = ["single_step", "multi_step", "cosine"]
 
 
-class _BaseWarmupScheduler(_LRScheduler):
+class _BaseWarmupScheduler(TorchLRScheduler):
 
     def __init__(
         self,
