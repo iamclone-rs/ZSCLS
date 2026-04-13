@@ -29,6 +29,7 @@ import trainers.maple
 import trainers.independentVL
 import trainers.promptsrc
 import trainers.hicropl
+import trainers.splipdistill
 
 def print_args(args, cfg):
     print("***************")
@@ -143,6 +144,15 @@ def extend_cfg(cfg):
     cfg.TRAINER.HICROPL.PROMPT_DEPTH = 9  # Max 12, minimum 0, for 1 it will act as shallow HICROPL (J=1)
     cfg.TRAINER.HICROPL.TEACHER_NAME = "ViT-L/14"
     cfg.TRAINER.HICROPL.LAMBD = 10.
+
+    cfg.TRAINER.SPLIPDISTILL = CN()
+    cfg.TRAINER.SPLIPDISTILL.N_CTX_TEXT = 4
+    cfg.TRAINER.SPLIPDISTILL.N_CTX_VISION = 2
+    cfg.TRAINER.SPLIPDISTILL.CTX_INIT = "a photo of a"
+    cfg.TRAINER.SPLIPDISTILL.PREC = "fp16"
+    cfg.TRAINER.SPLIPDISTILL.PROMPT_DEPTH = 12
+    cfg.TRAINER.SPLIPDISTILL.TEACHER_NAME = "ViT-B/16"
+    cfg.TRAINER.SPLIPDISTILL.LAMBD = 12.
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
 
 

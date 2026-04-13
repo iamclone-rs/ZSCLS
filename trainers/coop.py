@@ -64,45 +64,45 @@ class PromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         n_cls = len(classnames) # number of classes
-        n_ctx = cfg.TRAINER.COOP.N_CTX 
-        ctx_init = cfg.TRAINER.COOP.CTX_INIT
-        dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-        clip_imsize = clip_model.visual.input_resolution
-        cfg_imsize = cfg.INPUT.SIZE[0]
+        n_ctx = cfg.TRAINER.COOP.N_CTX  # number of learnable ctx vectors per class
+        ctx_init = cfg.TRAINER.COOP.CTX_INIT # "a photo of a" or None
+        dtype = clip_model.dtype # fp16
+        ctx_dim = clip_model.ln_final.weight.shape[0] # 512
+        clip_imsize = clip_model.visual.input_resolution # 224
+        cfg_imsize = cfg.INPUT.SIZE[0] # 224
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         if ctx_init:
-            # use given words to initialize context vectors
-            ctx_init = ctx_init.replace("_", " ")
+            ctx_init = ctx_init.replace("_", " ") # "a_photo_of_a" -> "a photo of a"
             n_ctx = len(ctx_init.split(" "))
-            prompt = clip.tokenize(ctx_init)
+            prompt = clip.tokenize(ctx_init) # [1, 77], exp : [[49406, 320, 1125, 539, 49407, 0, 0, 0, ..., 0]]
             with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
-            prompt_prefix = ctx_init
+                embedding = clip_model.token_embedding(prompt).type(dtype) # [1, 77, 512]
+            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :] # [n_ctx, 512]
+            prompt_prefix = ctx_init # "a photo of a"
 
         else:
             # random initialization
             if cfg.TRAINER.COOP.CSC:
                 print("Initializing class-specific contexts")
-                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
+                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype) # [n_cls, n_ctx, 512]
             else:
                 print("Initializing a generic context")
-                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-            nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = " ".join(["X"] * n_ctx)
+                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype) # [n_ctx, 512]
+            nn.init.normal_(ctx_vectors, std=0.02) #init weights with Gaussian distribution
+            prompt_prefix = " ".join(["X"] * n_ctx) # "X" * 16
 
         print(f'Initial context: "{prompt_prefix}"')
         print(f"Number of context words (tokens): {n_ctx}")
 
-        self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
+        self.ctx = nn.Parameter(ctx_vectors)  # [n_ctx, 512] or [n_cls, n_ctx, 512]
 
-        classnames = [name.replace("_", " ") for name in classnames]
-        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        prompts = [prompt_prefix + " " + name + "." for name in classnames]
+        classnames = [name.replace("_", " ") for name in classnames] #[air_traffic_control] -> [air traffic control]
+        name_lens = [len(_tokenizer.encode(name)) for name in classnames] # 
+        prompts = [prompt_prefix + " " + name + "." for name in classnames] 
+        # ["a photo of a " + "air traffic control" + "."] -> ["a photo of a air traffic control."] 
 
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]) # 
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
 
@@ -135,6 +135,7 @@ class PromptLearner(nn.Module):
                 ],
                 dim=1,
             )
+
 
         elif self.class_token_position == "middle":
             half_n_ctx = self.n_ctx // 2
