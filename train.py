@@ -30,6 +30,7 @@ import trainers.independentVL
 import trainers.promptsrc
 import trainers.hicropl
 import trainers.splipdistill
+import trainers.hicrosplip
 
 def print_args(args, cfg):
     print("***************")
@@ -153,6 +154,16 @@ def extend_cfg(cfg):
     cfg.TRAINER.SPLIPDISTILL.PROMPT_DEPTH = 12
     cfg.TRAINER.SPLIPDISTILL.TEACHER_NAME = "ViT-B/16"
     cfg.TRAINER.SPLIPDISTILL.LAMBD = 12.
+    cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+
+    cfg.TRAINER.HICROSPLIP = CN()
+    cfg.TRAINER.HICROSPLIP.N_CTX = 16
+    cfg.TRAINER.HICROSPLIP.CROSS_LAYER = 6
+    cfg.TRAINER.HICROSPLIP.CTX_INIT = "a photo of a"
+    cfg.TRAINER.HICROSPLIP.PREC = "fp16"
+    cfg.TRAINER.HICROSPLIP.PROMPT_DEPTH = 12
+    cfg.TRAINER.HICROSPLIP.TEACHER_NAME = "ViT-B/16"
+    cfg.TRAINER.HICROSPLIP.LAMBD = 12.
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
 
 

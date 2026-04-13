@@ -300,7 +300,10 @@ class ResidualAttentionBlock_HiCroPL(nn.Module):
                 prefix = x[0:x.shape[0] - self.cross_prompt_nctx, :, :]
                 # Create/configure learnable tokens of this layer
                 visual_context = cross_prompts_deeper[self.i-1]
-                visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                if visual_context.dim() == 2:
+                    visual_context = visual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(x.dtype)
+                else:
+                    visual_context = visual_context.permute(1, 0, 2).to(x.dtype)
                 # Add the learnable tokens of this layer with the input, by replacing the previous
                 # layer learnable tokens
                 x = torch.cat([prefix, visual_context], dim=0)
@@ -312,7 +315,10 @@ class ResidualAttentionBlock_HiCroPL(nn.Module):
                 suffix = x[1 + self.cross_prompt_nctx:, :, :]
                 # Create/configure learnable tokens of this layer
                 textual_context = cross_prompts_deeper[self.i-1]
-                textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                if textual_context.dim() == 2:
+                    textual_context = textual_context.expand(x.shape[1], -1, -1).permute(1, 0, 2).to(x.dtype)
+                else:
+                    textual_context = textual_context.permute(1, 0, 2).to(x.dtype)
                 # Add the learnable tokens of this layer with the input, replaced by previous
                 # layer learnable tokens
                 x = torch.cat([prefix, textual_context, suffix], dim=0)
@@ -531,7 +537,10 @@ class VisionTransformer_HiCroPL(nn.Module):
         # After positional embeddings, we will attach prompts with the model, remember only those
         # are trainable parameters here in whole image encoder.
         if self.VPT_shallow:
-            visual_ctx = img_prompts.expand(x.shape[0], -1, -1).half()
+            if img_prompts.dim() == 2:
+                visual_ctx = img_prompts.expand(x.shape[0], -1, -1).to(x.dtype)
+            else:
+                visual_ctx = img_prompts.to(x.dtype)
             x = torch.cat([x, visual_ctx], dim=1)
         else:
             assert self.prompt_till_layer_visual == 0
