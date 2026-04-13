@@ -41,6 +41,7 @@ class EuroSAT(DatasetBase):
             OxfordPets.save_split(train, val, test, self.split_path, self.image_dir)
 
         num_shots = cfg.DATASET.NUM_SHOTS
+        use_full_val = cfg.DATASET.FULL_VAL
         if num_shots >= 1:
             seed = cfg.SEED
             preprocessed = os.path.join(self.split_fewshot_dir, f"shot_{num_shots}-seed_{seed}.pkl")
@@ -49,14 +50,23 @@ class EuroSAT(DatasetBase):
                 print(f"Loading preprocessed few-shot data from {preprocessed}")
                 with open(preprocessed, "rb") as file:
                     data = pickle.load(file)
-                    train, val = data["train"], data["val"]
+                    train = data["train"]
+                    if not use_full_val:
+                        val = data["val"]
             else:
                 train = self.generate_fewshot_dataset(train, num_shots=num_shots)
-                val = self.generate_fewshot_dataset(val, num_shots=min(num_shots, 4))
-                data = {"train": train, "val": val}
+                val_fewshot = self.generate_fewshot_dataset(
+                    val, num_shots=min(num_shots, 4)
+                )
+                data = {"train": train, "val": val_fewshot}
                 print(f"Saving preprocessed few-shot data to {preprocessed}")
                 with open(preprocessed, "wb") as file:
                     pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL)
+                if not use_full_val:
+                    val = val_fewshot
+
+            if use_full_val:
+                print("Using the full validation split for model selection.")
 
         subsample = cfg.DATASET.SUBSAMPLE_CLASSES
         train, val, test = OxfordPets.subsample_classes(train, val, test, subsample=subsample)
