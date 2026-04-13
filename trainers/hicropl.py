@@ -361,9 +361,9 @@ class CustomCLIP(nn.Module):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
-        with torch.no_grad():
-            image_features_fixed = self.prompt_learner.ZS_image_encoder(image.type(self.dtype))
-            image_features_fixed = image_features_fixed / image_features_fixed.norm(dim=-1, keepdim=True)
+        # Keep autograd enabled so the teacher image LayerNorms can be tuned.
+        image_features_fixed = self.prompt_learner.ZS_image_encoder(image.type(self.dtype))
+        image_features_fixed = image_features_fixed / image_features_fixed.norm(dim=-1, keepdim=True)
 
         # Compute the prompted image and text features
         text_input, visual_ctx, cross_prompts_text_deeper, cross_prompts_visual_deeper = self.prompt_learner()
@@ -442,17 +442,24 @@ class HiCroPL(TrainerX):
 
         print("Turning off gradients in both the image and the text encoder")
         name_to_update = "prompt_learner"
+        teacher_ln_names = (".ln_pre.", ".ln_post.", ".ln_1.", ".ln_2.")
 
         for name, param in self.model.named_parameters():
-            if name_to_update not in name:
-                # Make sure that VPT prompts are updated
-                if "VPT" in name:
-                    param.requires_grad_(True)
-                else:
-                    param.requires_grad_(False)
-            else:
-                if "ZS_image_encoder" in name:
-                    param.requires_grad_(False)
+            trainable = False
+
+            # Keep HiCroPL prompt-learning modules trainable as before.
+            if name_to_update in name and "ZS_image_encoder" not in name:
+                trainable = True
+            # Allow tuning only the LayerNorms inside the teacher image encoder.
+            elif name.startswith("prompt_learner.ZS_image_encoder") and any(
+                ln_name in name for ln_name in teacher_ln_names
+            ):
+                trainable = True
+            # Make sure that VPT prompts are updated.
+            elif "VPT" in name:
+                trainable = True
+
+            param.requires_grad_(trainable)
 
 
         # Double check
@@ -466,8 +473,9 @@ class HiCroPL(TrainerX):
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
-        # NOTE: only give prompt_learner to the optimizer
-        self.optim = build_optimizer(self.model, cfg.OPTIM)
+        # Only optimize parameters that remain trainable.
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        self.optim = build_optimizer(trainable_params, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("VLPromptLearner", self.model, self.optim, self.sched)
 
