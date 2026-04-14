@@ -443,7 +443,7 @@ class HiCroPL(TrainerX):
         print("Turning off gradients in both the image and the text encoder")
         name_to_update = "prompt_learner"
         # teacher_ln_names = (".ln_pre.", ".ln_post.", ".ln_1.", ".ln_2.")
-        teacher_ln_names = (".ln_pre.", ".ln_post.", ".ln_2.")
+        teacher_ln_names = (".ln_2.")
         for name, param in self.model.named_parameters():
             trainable = False
 
