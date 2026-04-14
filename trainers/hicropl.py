@@ -444,7 +444,7 @@ class HiCroPL(TrainerX):
         name_to_update = "prompt_learner"
         # teacher_ln_names = (".ln_pre.", ".ln_post.", ".ln_1.", ".ln_2.")
         # teacher_ln_names = (".ln_pre.", ".ln_post.")
-        teacher_ln_names = (".ln_1.")
+        teacher_ln_names = ()
         for name, param in self.model.named_parameters():
             trainable = False
 
