@@ -42,6 +42,10 @@ CoPrompt_dataset_name_mapping = {
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
+
+def _normalize_features(features):
+    return features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
 def load_clip_to_cpu_teacher(cfg, zero_shot_model=False):
     backbone_name = cfg.TRAINER.HICROPL.TEACHER_NAME
     url = clip._MODELS[backbone_name]
@@ -175,6 +179,9 @@ class CrossModalPromptLearner(nn.Module):
         cfg_imsize = cfg.INPUT.SIZE[0]
         self.cross_prompts_depth = cfg.TRAINER.HICROPL.PROMPT_DEPTH
         self.cross_layer = cfg.TRAINER.HICROPL.CROSS_LAYER
+        self.use_semantic_bank = cfg.TRAINER.HICROPL.USE_SEMANTIC_BANK
+        self.semantic_bank_temperature = cfg.TRAINER.HICROPL.SEMANTIC_BANK_TEMPERATURE
+        self.semantic_bank_max_prompts = cfg.TRAINER.HICROPL.SEMANTIC_BANK_MAX_PROMPTS
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         ######## cross-modal text token initialization ########
@@ -238,10 +245,21 @@ class CrossModalPromptLearner(nn.Module):
         with open(f"gpt_file/{CoPrompt_dataset_name_mapping[cfg.DATASET.NAME]}_prompt.json") as f:
             gpt3_prompt = json.load(f)
         print("\nGetting textual features as CLIP's classifier.")
-        clip_weights = gpt_clip_classifier(
-            classnames, gpt3_prompt, clip_model_temp, cfg.DATASET.NAME
+        clip_weights, semantic_bank, semantic_bank_mask = build_gpt_semantic_bank(
+            classnames,
+            gpt3_prompt,
+            clip_model_temp,
+            cfg.DATASET.NAME,
+            max_prompts=self.semantic_bank_max_prompts,
         )
-        self.fixed_embeddings = clip_weights
+        self.register_buffer("fixed_embeddings", clip_weights)
+        self.register_buffer("semantic_bank", semantic_bank)
+        self.register_buffer("semantic_bank_mask", semantic_bank_mask)
+        if self.use_semantic_bank:
+            print(
+                f"Semantic bank enabled with {self.semantic_bank.shape[1]} "
+                f"prototypes per class."
+            )
         ######## preparation for distillation end ########
 
         classnames = [name.replace("_", " ") for name in classnames]
@@ -263,6 +281,21 @@ class CrossModalPromptLearner(nn.Module):
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor, [n_cls, 77]
         self.name_lens = name_lens
 
+    def query_semantic_bank(self, text_features):
+        if not self.use_semantic_bank:
+            return self.fixed_embeddings.to(text_features.dtype)
+
+        bank = _normalize_features(self.semantic_bank.float())
+        query = _normalize_features(text_features.float())
+        temperature = max(float(self.semantic_bank_temperature), 1e-6)
+        scores = (query.unsqueeze(1) * bank).sum(dim=-1) / temperature
+        scores = scores.masked_fill(~self.semantic_bank_mask, -1e4)
+        weights = F.softmax(scores, dim=-1)
+        attended = torch.sum(weights.unsqueeze(-1) * bank, dim=1)
+        semantic_features = _normalize_features(
+            attended + self.fixed_embeddings.float()
+        )
+        return semantic_features.to(text_features.dtype)
 
     def construct_prompts(self, ctx, prefix, suffix, label=None):
         # dim0 is either batch_size (during training) or n_cls (during testing)
@@ -356,6 +389,8 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
         self.lambd = cfg.TRAINER.HICROPL.LAMBD
+        self.use_semantic_bank = cfg.TRAINER.HICROPL.USE_SEMANTIC_BANK
+        self.semantic_bank_alpha = cfg.TRAINER.HICROPL.SEMANTIC_BANK_ALPHA
 
     def forward(self, image, label=None):
         tokenized_prompts = self.tokenized_prompts
@@ -370,12 +405,20 @@ class CustomCLIP(nn.Module):
         text_features = self.text_encoder(text_input, tokenized_prompts, cross_prompts_text_deeper)
         image_features = self.image_encoder(image.type(self.dtype), visual_ctx, cross_prompts_visual_deeper)
 
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        image_features = _normalize_features(image_features)
         image_features = image_features + image_features_fixed
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        text_features = text_features + self.prompt_learner.fixed_embeddings.half()
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        image_features = _normalize_features(image_features)
+        text_features = _normalize_features(text_features)
+        if self.use_semantic_bank:
+            semantic_features = self.prompt_learner.query_semantic_bank(text_features)
+            text_features = (
+                (1.0 - self.semantic_bank_alpha) * text_features.float()
+                + self.semantic_bank_alpha * semantic_features.float()
+            )
+            text_features = _normalize_features(text_features).to(self.dtype)
+        else:
+            text_features = text_features + self.prompt_learner.fixed_embeddings.to(text_features.dtype)
+            text_features = _normalize_features(text_features)
         # prompted logits
         logits = logit_scale * image_features @ text_features.t()
 
@@ -383,43 +426,68 @@ class CustomCLIP(nn.Module):
             loss_cls = F.cross_entropy(logits, label)
             text_features_fixed = self.prompt_learner.fixed_embeddings
             cos = torch.nn.CosineSimilarity(dim=1, eps=1e-07)
-            score = cos(text_features, text_features_fixed)
+            score = cos(text_features.float(), text_features_fixed.float())
             loss_distill_text = 1.0 - torch.mean(score)
-            score = cos(image_features, image_features_fixed)
+            score = cos(image_features.float(), image_features_fixed.float())
             loss_distill_image = 1.0 - torch.mean(score)
             loss_distill = loss_distill_text + loss_distill_image
             return loss_cls + self.lambd * loss_distill
         return logits
 
 
-def gpt_clip_classifier(classnames, gpt_prompts, clip_model, dataset_name):
+def build_gpt_semantic_bank(classnames, gpt_prompts, clip_model, dataset_name, max_prompts=0):
     import os
     os.makedirs("cache/", exist_ok=True)
 
     with torch.no_grad():
-        clip_weights = []
+        class_means = []
+        prompt_banks = []
+        prompt_counts = []
+
+        if torch.cuda.is_available():
+            clip_model = clip_model.cuda()
+
         for classname in classnames:
             # Tokenize the prompts
             classname = classname.replace("_", " ")
-            texts = []
-            for t in gpt_prompts[classname]:
-                texts.append(t)
+            texts = list(gpt_prompts[classname])
+            if max_prompts > 0:
+                texts = texts[:max_prompts]
             texts = clip.tokenize(texts)
             if torch.cuda.is_available():
-                clip_model = clip_model.cuda()
                 texts = texts.cuda()
             # prompt ensemble
             class_embeddings = clip_model.encode_text(texts)
-            class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
-            class_embeddings = class_embeddings.mean(dim=0)
-            class_embeddings /= class_embeddings.norm()
-            clip_weights.append(class_embeddings)
+            class_embeddings = _normalize_features(class_embeddings)
+            class_mean = _normalize_features(class_embeddings.mean(dim=0, keepdim=True)).squeeze(0)
+            class_means.append(class_mean)
+            prompt_banks.append(class_embeddings)
+            prompt_counts.append(class_embeddings.shape[0])
 
-        clip_weights = torch.stack(clip_weights, dim=0)
-        if torch.cuda.is_available():
-            clip_weights = clip_weights.cuda()
+        clip_weights = torch.stack(class_means, dim=0)
+        max_bank_size = max(prompt_counts)
+        embed_dim = clip_weights.shape[-1]
+        semantic_bank = clip_weights.new_zeros(len(classnames), max_bank_size, embed_dim)
+        semantic_bank_mask = torch.zeros(
+            len(classnames), max_bank_size, device=clip_weights.device, dtype=torch.bool
+        )
+
+        for idx, class_embeddings in enumerate(prompt_banks):
+            prompt_count = class_embeddings.shape[0]
+            semantic_bank[idx, :prompt_count] = class_embeddings
+            semantic_bank_mask[idx, :prompt_count] = True
+
         torch.save(clip_weights, f"cache/{dataset_name}_clip_weights_random.pt")
-    return clip_weights
+        bank_tag = "all" if max_prompts <= 0 else str(max_prompts)
+        torch.save(
+            {
+                "semantic_bank": semantic_bank,
+                "semantic_bank_mask": semantic_bank_mask,
+            },
+            f"cache/{dataset_name}_semantic_bank_top{bank_tag}.pt",
+        )
+
+    return clip_weights, semantic_bank, semantic_bank_mask
 
 @TRAINER_REGISTRY.register()
 class HiCroPL(TrainerX):
