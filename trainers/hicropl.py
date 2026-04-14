@@ -157,6 +157,30 @@ class CrossPromptAttention(nn.Module):
         return q_proj
 
 
+class VisionGuidedTextPrompting(nn.Module):
+    def __init__(self, hidden_size, visual_hidden_size, num_attention_heads):
+        super().__init__()
+        self.visual_proj = nn.Linear(visual_hidden_size, hidden_size)
+        self.attn = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=num_attention_heads)
+        self.ln_q = nn.LayerNorm(hidden_size)
+        self.ln_kv = nn.LayerNorm(hidden_size)
+        self.ffn = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(hidden_size, hidden_size * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(hidden_size * 4, hidden_size))
+        ]))
+        self.ln_out = nn.LayerNorm(hidden_size)
+
+    def forward(self, text_prompts, visual_tokens):
+        q = self.ln_q(text_prompts).permute(1, 0, 2)
+        kv = self.visual_proj(visual_tokens)
+        kv = self.ln_kv(kv).permute(1, 0, 2)
+        attn_out = self.attn(q, kv, kv, need_weights=False)[0].permute(1, 0, 2)
+        updated = text_prompts + attn_out
+        updated = updated + self.ffn(self.ln_out(updated))
+        return updated
+
+
 class CrossModalPromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
@@ -175,6 +199,8 @@ class CrossModalPromptLearner(nn.Module):
         cfg_imsize = cfg.INPUT.SIZE[0]
         self.cross_prompts_depth = cfg.TRAINER.HICROPL.PROMPT_DEPTH
         self.cross_layer = cfg.TRAINER.HICROPL.CROSS_LAYER
+        self.use_vision_guided_text = cfg.TRAINER.HICROPL.USE_VISION_GUIDED_TEXT
+        self.vision_guided_text_alpha = cfg.TRAINER.HICROPL.VISION_GUIDED_TEXT_ALPHA
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         ######## cross-modal text token initialization ########
@@ -234,6 +260,24 @@ class CrossModalPromptLearner(nn.Module):
         clip_model_temp_image = load_clip_to_cpu_teacher(cfg, True)
         with torch.no_grad():
             self.ZS_image_encoder = clip_model_temp_image.visual
+        if self.use_vision_guided_text:
+            required_attrs = ("class_embedding", "positional_embedding", "ln_pre", "conv1")
+            if not all(hasattr(self.ZS_image_encoder, attr) for attr in required_attrs):
+                raise ValueError(
+                    "Vision-guided textual prompting currently supports only ViT-style CLIP teachers."
+                )
+            teacher_patch_dim = self.ZS_image_encoder.conv1.weight.shape[0]
+            vision_guided_text = VisionGuidedTextPrompting(
+                hidden_size=ctx_dim,
+                visual_hidden_size=teacher_patch_dim,
+                num_attention_heads=8,
+            )
+            self.vision_guided_text_nets = _get_clones(
+                vision_guided_text, self.cross_prompts_depth
+            )
+            if cfg.TRAINER.HICROPL.PREC == "fp16":
+                self.vision_guided_text_nets = self.vision_guided_text_nets.half()
+            print("Vision-guided textual prompting is enabled.")
         # text
         with open(f"gpt_file/{CoPrompt_dataset_name_mapping[cfg.DATASET.NAME]}_prompt.json") as f:
             gpt3_prompt = json.load(f)
@@ -263,6 +307,57 @@ class CrossModalPromptLearner(nn.Module):
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor, [n_cls, 77]
         self.name_lens = name_lens
 
+    def extract_teacher_patch_tokens(self, image):
+        visual = self.ZS_image_encoder
+        x = image.type(visual.conv1.weight.dtype)
+        x = visual.conv1(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat(
+            [
+                visual.class_embedding.to(x.dtype)
+                + torch.zeros(
+                    x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+                ),
+                x,
+            ],
+            dim=1,
+        )
+        x = x + visual.positional_embedding.to(x.dtype)
+        x = visual.ln_pre(x)
+        return x[:, 1:, :]
+
+    def build_vision_guided_text_prompts(self, image):
+        batch_size = image.shape[0]
+        with torch.no_grad():
+            patch_tokens = self.extract_teacher_patch_tokens(image)
+        conditioned_text_prompts = []
+
+        for i in range(self.cross_prompts_depth):
+            base_prompt = self.cross_prompts_text[i].unsqueeze(0).expand(batch_size, -1, -1)
+            conditioned_prompt = self.vision_guided_text_nets[i](base_prompt, patch_tokens)
+            mixed_prompt = (
+                (1.0 - self.vision_guided_text_alpha) * base_prompt
+                + self.vision_guided_text_alpha * conditioned_prompt
+            )
+            conditioned_text_prompts.append(mixed_prompt)
+
+        ctx = conditioned_text_prompts[0].unsqueeze(1).expand(-1, self.n_cls, -1, -1)
+        prefix = self.token_prefix.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        suffix = self.token_suffix.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        text_input = torch.cat([prefix, ctx, suffix], dim=2)
+        text_input = text_input.reshape(
+            batch_size * self.n_cls, text_input.shape[2], text_input.shape[3]
+        )
+
+        cross_prompts_text_deeper = []
+        for prompt in conditioned_text_prompts[1:]:
+            prompt = prompt.unsqueeze(1).expand(-1, self.n_cls, -1, -1)
+            prompt = prompt.reshape(batch_size * self.n_cls, prompt.shape[2], prompt.shape[3])
+            cross_prompts_text_deeper.append(prompt)
+
+        return text_input, cross_prompts_text_deeper, batch_size
+
 
     def construct_prompts(self, ctx, prefix, suffix, label=None):
         # dim0 is either batch_size (during training) or n_cls (during testing)
@@ -284,15 +379,19 @@ class CrossModalPromptLearner(nn.Module):
         )
         return prompts
 
-    def forward(self):
-        # first layer text token
-        ctx = self.cross_prompts_text[0]
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)  # [n_cls, 4, 512]
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-        # construct first layer text input
-        text_input = self.construct_prompts(ctx, prefix, suffix)  # [n_cls, 77, 512]
+    def forward(self, image=None):
+        prompt_batch_size = None
+        text_input = None
+        cross_prompts_text_deeper = None
+        if not (self.use_vision_guided_text and image is not None):
+            # first layer text token
+            ctx = self.cross_prompts_text[0]
+            if ctx.dim() == 2:
+                ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)  # [n_cls, 4, 512]
+            prefix = self.token_prefix
+            suffix = self.token_suffix
+            # construct first layer text input
+            text_input = self.construct_prompts(ctx, prefix, suffix)  # [n_cls, 77, 512]
 
         ######## T->I mapping ########
         visual_prompts = torch.cat([self.cross_prompts_visual[i].unsqueeze(0) for i in range(self.cross_layer)], dim=0)  # [self.cross_layer, n_ctx, 768]
@@ -341,9 +440,12 @@ class CrossModalPromptLearner(nn.Module):
         ######## I->T mapping end ########
 
         # extract deeper prompts
-        cross_prompts_text_deeper = [self.cross_prompts_text[i] for i in range(1, len(self.cross_prompts_text))]
+        if self.use_vision_guided_text and image is not None:
+            text_input, cross_prompts_text_deeper, prompt_batch_size = self.build_vision_guided_text_prompts(image)
+        else:
+            cross_prompts_text_deeper = [self.cross_prompts_text[i] for i in range(1, len(self.cross_prompts_text))]
         cross_prompts_visual_deeper = [self.cross_prompts_visual[i] for i in range(1, len(self.cross_prompts_visual))]
-        return text_input, self.cross_prompts_visual[0], cross_prompts_text_deeper, cross_prompts_visual_deeper
+        return text_input, self.cross_prompts_visual[0], cross_prompts_text_deeper, cross_prompts_visual_deeper, prompt_batch_size
 
 
 class CustomCLIP(nn.Module):
@@ -358,7 +460,6 @@ class CustomCLIP(nn.Module):
         self.lambd = cfg.TRAINER.HICROPL.LAMBD
 
     def forward(self, image, label=None):
-        tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
         # Keep autograd enabled so the teacher image LayerNorms can be tuned.
@@ -366,27 +467,46 @@ class CustomCLIP(nn.Module):
         image_features_fixed = image_features_fixed / image_features_fixed.norm(dim=-1, keepdim=True)
 
         # Compute the prompted image and text features
-        text_input, visual_ctx, cross_prompts_text_deeper, cross_prompts_visual_deeper = self.prompt_learner()
+        text_input, visual_ctx, cross_prompts_text_deeper, cross_prompts_visual_deeper, prompt_batch_size = self.prompt_learner(image)
+        if prompt_batch_size is None:
+            tokenized_prompts = self.tokenized_prompts
+        else:
+            tokenized_prompts = self.tokenized_prompts.unsqueeze(0).expand(
+                prompt_batch_size, -1, -1
+            )
+            tokenized_prompts = tokenized_prompts.reshape(
+                prompt_batch_size * self.prompt_learner.n_cls, -1
+            )
         text_features = self.text_encoder(text_input, tokenized_prompts, cross_prompts_text_deeper)
         image_features = self.image_encoder(image.type(self.dtype), visual_ctx, cross_prompts_visual_deeper)
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         image_features = image_features + image_features_fixed
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        text_features = text_features + self.prompt_learner.fixed_embeddings.half()
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        # prompted logits
-        logits = logit_scale * image_features @ text_features.t()
+        if prompt_batch_size is None:
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            text_features = text_features + self.prompt_learner.fixed_embeddings.to(text_features.dtype)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            logits = logit_scale * image_features @ text_features.t()
+            text_features_fixed = self.prompt_learner.fixed_embeddings.to(text_features.dtype)
+        else:
+            text_features = text_features.view(prompt_batch_size, self.prompt_learner.n_cls, -1)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            text_features_fixed = self.prompt_learner.fixed_embeddings.unsqueeze(0).expand(
+                prompt_batch_size, -1, -1
+            ).to(text_features.dtype)
+            text_features = text_features + text_features_fixed
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            logits = logit_scale * torch.einsum("bd,bcd->bc", image_features, text_features)
 
         if self.prompt_learner.training:
             loss_cls = F.cross_entropy(logits, label)
-            text_features_fixed = self.prompt_learner.fixed_embeddings
-            cos = torch.nn.CosineSimilarity(dim=1, eps=1e-07)
-            score = cos(text_features, text_features_fixed)
-            loss_distill_text = 1.0 - torch.mean(score)
-            score = cos(image_features, image_features_fixed)
-            loss_distill_image = 1.0 - torch.mean(score)
+            text_score = F.cosine_similarity(
+                text_features, text_features_fixed, dim=text_features.dim() - 1, eps=1e-07
+            )
+            loss_distill_text = 1.0 - torch.mean(text_score)
+            image_score = F.cosine_similarity(image_features, image_features_fixed, dim=1, eps=1e-07)
+            loss_distill_image = 1.0 - torch.mean(image_score)
             loss_distill = loss_distill_text + loss_distill_image
             return loss_cls + self.lambd * loss_distill
         return logits
@@ -443,7 +563,6 @@ class HiCroPL(TrainerX):
         print("Turning off gradients in both the image and the text encoder")
         name_to_update = "prompt_learner"
         # teacher_ln_names = (".ln_pre.", ".ln_post.", ".ln_1.", ".ln_2.")
-        # teacher_ln_names = (".ln_pre.", ".ln_post.")
         teacher_ln_names = ()
         for name, param in self.model.named_parameters():
             trainable = False
