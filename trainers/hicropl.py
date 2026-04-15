@@ -372,7 +372,9 @@ class CustomCLIP(nn.Module):
         self.dtype = clip_model.dtype
         self.lambd = cfg.TRAINER.HICROPL.LAMBD
         self.use_cls_layer_distill = cfg.TRAINER.HICROPL.USE_CLS_LAYER_DISTILL
-        self.cls_layer_distill_weight = cfg.TRAINER.HICROPL.CLS_LAYER_DISTILL_WEIGHT
+        self.cls_layer_distill_alpha = cfg.TRAINER.HICROPL.CLS_LAYER_DISTILL_ALPHA
+        if self.cls_layer_distill_alpha == 1.0 and cfg.TRAINER.HICROPL.CLS_LAYER_DISTILL_WEIGHT != 1.0:
+            self.cls_layer_distill_alpha = cfg.TRAINER.HICROPL.CLS_LAYER_DISTILL_WEIGHT
 
     def _match_layer_tokens(self, student_tokens, teacher_tokens):
         num_pairs = min(len(student_tokens), len(teacher_tokens))
@@ -506,6 +508,7 @@ class CustomCLIP(nn.Module):
             score = cos(image_features, image_features_fixed)
             loss_distill_image = 1.0 - torch.mean(score)
             loss_distill = loss_distill_text + loss_distill_image
+            loss_distill_layer = image_features.new_zeros(())
 
             if self.use_cls_layer_distill:
                 matched_student, matched_teacher = self._match_layer_tokens(
@@ -518,10 +521,9 @@ class CustomCLIP(nn.Module):
                     student_cls = student_cls / student_cls.norm(dim=-1, keepdim=True)
                     teacher_cls = teacher_cls / teacher_cls.norm(dim=-1, keepdim=True)
                     score = F.cosine_similarity(student_cls, teacher_cls, dim=-1, eps=1e-07)
-                    loss_distill_cls = 1.0 - torch.mean(score)
-                    loss_distill = loss_distill + self.cls_layer_distill_weight * loss_distill_cls
+                    loss_distill_layer = 1.0 - torch.mean(score)
 
-            return loss_cls + self.lambd * loss_distill
+            return loss_cls + self.lambd * loss_distill + self.cls_layer_distill_alpha * loss_distill_layer
         return logits
 
 
