@@ -175,6 +175,7 @@ class CrossModalPromptLearner(nn.Module):
         cfg_imsize = cfg.INPUT.SIZE[0]
         self.cross_prompts_depth = cfg.TRAINER.HICROPL.PROMPT_DEPTH
         self.cross_layer = cfg.TRAINER.HICROPL.CROSS_LAYER
+        self.use_cls_layer_distill = cfg.TRAINER.HICROPL.USE_CLS_LAYER_DISTILL
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         ######## cross-modal text token initialization ########
@@ -234,6 +235,20 @@ class CrossModalPromptLearner(nn.Module):
         clip_model_temp_image = load_clip_to_cpu_teacher(cfg, True)
         with torch.no_grad():
             self.ZS_image_encoder = clip_model_temp_image.visual
+        if self.use_cls_layer_distill:
+            required_attrs = ("conv1", "class_embedding", "positional_embedding", "ln_pre", "transformer", "ln_post")
+            student_visual = clip_model.visual
+            if not all(hasattr(student_visual, attr) for attr in required_attrs):
+                raise ValueError("Layer-wise CLS distillation currently supports only ViT-style student backbones.")
+            if not all(hasattr(self.ZS_image_encoder, attr) for attr in required_attrs):
+                raise ValueError("Layer-wise CLS distillation currently supports only ViT-style teacher backbones.")
+
+            student_hidden = student_visual.ln_pre.weight.shape[0]
+            teacher_hidden = self.ZS_image_encoder.ln_pre.weight.shape[0]
+            if student_hidden == teacher_hidden:
+                self.cls_distill_proj = nn.Identity()
+            else:
+                self.cls_distill_proj = nn.Linear(student_hidden, teacher_hidden, bias=False)
         # text
         with open(f"gpt_file/{CoPrompt_dataset_name_mapping[cfg.DATASET.NAME]}_prompt.json") as f:
             gpt3_prompt = json.load(f)
@@ -356,19 +371,122 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
         self.lambd = cfg.TRAINER.HICROPL.LAMBD
+        self.use_cls_layer_distill = cfg.TRAINER.HICROPL.USE_CLS_LAYER_DISTILL
+        self.cls_layer_distill_weight = cfg.TRAINER.HICROPL.CLS_LAYER_DISTILL_WEIGHT
+
+    def _match_layer_tokens(self, student_tokens, teacher_tokens):
+        num_pairs = min(len(student_tokens), len(teacher_tokens))
+        if num_pairs == 0:
+            return [], []
+
+        if len(student_tokens) == num_pairs:
+            student_indices = list(range(len(student_tokens)))
+        else:
+            student_indices = torch.linspace(
+                0, len(student_tokens) - 1, steps=num_pairs
+            ).round().long().tolist()
+
+        if len(teacher_tokens) == num_pairs:
+            teacher_indices = list(range(len(teacher_tokens)))
+        else:
+            teacher_indices = torch.linspace(
+                0, len(teacher_tokens) - 1, steps=num_pairs
+            ).round().long().tolist()
+
+        matched_student = [student_tokens[idx] for idx in student_indices]
+        matched_teacher = [teacher_tokens[idx] for idx in teacher_indices]
+        return matched_student, matched_teacher
+
+    def _forward_teacher_vit_with_cls_tokens(self, image):
+        visual = self.prompt_learner.ZS_image_encoder
+        x = image.type(visual.conv1.weight.dtype)
+        x = visual.conv1(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat(
+            [
+                visual.class_embedding.to(x.dtype)
+                + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+                x,
+            ],
+            dim=1,
+        )
+        x = x + visual.positional_embedding.to(x.dtype)
+        if getattr(visual, "VPT_shallow", False):
+            visual_ctx = visual.VPT.expand(x.shape[0], -1, -1).to(x.dtype)
+            x = torch.cat([x, visual_ctx], dim=1)
+
+        x = visual.ln_pre(x)
+        x = x.permute(1, 0, 2)
+
+        cls_tokens = []
+        for block in visual.transformer.resblocks:
+            x = block(x)
+            cls_tokens.append(x[0].float())
+
+        x = x.permute(1, 0, 2)
+        image_features = visual.ln_post(x[:, 0, :])
+        if visual.proj is not None:
+            image_features = image_features @ visual.proj
+
+        return image_features, cls_tokens
+
+    def _forward_student_vit_with_cls_tokens(self, image, visual_ctx, cross_prompts_visual_deeper):
+        visual = self.image_encoder
+        x = image.type(visual.conv1.weight.dtype)
+        x = visual.conv1(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat(
+            [
+                visual.class_embedding.to(x.dtype)
+                + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+                x,
+            ],
+            dim=1,
+        )
+        x = x + visual.positional_embedding.to(x.dtype)
+        if visual.VPT_shallow:
+            prompt_tokens = visual_ctx.expand(x.shape[0], -1, -1).to(x.dtype)
+            x = torch.cat([x, prompt_tokens], dim=1)
+
+        x = visual.ln_pre(x)
+        x = x.permute(1, 0, 2)
+
+        inputs = [x, cross_prompts_visual_deeper]
+        cls_tokens = []
+        for block in visual.transformer.resblocks:
+            inputs = block(inputs)
+            cls_tokens.append(inputs[0][0].float())
+
+        x = inputs[0].permute(1, 0, 2)
+        image_features = visual.ln_post(x[:, 0, :])
+        if visual.proj is not None:
+            image_features = image_features @ visual.proj
+
+        return image_features, cls_tokens
 
     def forward(self, image, label=None):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
-        with torch.no_grad():
-            image_features_fixed = self.prompt_learner.ZS_image_encoder(image.type(self.dtype))
-            image_features_fixed = image_features_fixed / image_features_fixed.norm(dim=-1, keepdim=True)
-
         # Compute the prompted image and text features
         text_input, visual_ctx, cross_prompts_text_deeper, cross_prompts_visual_deeper = self.prompt_learner()
         text_features = self.text_encoder(text_input, tokenized_prompts, cross_prompts_text_deeper)
-        image_features = self.image_encoder(image.type(self.dtype), visual_ctx, cross_prompts_visual_deeper)
+        if self.use_cls_layer_distill:
+            with torch.no_grad():
+                image_features_fixed, teacher_cls_tokens = self._forward_teacher_vit_with_cls_tokens(image)
+            image_features, student_cls_tokens = self._forward_student_vit_with_cls_tokens(
+                image, visual_ctx, cross_prompts_visual_deeper
+            )
+        else:
+            with torch.no_grad():
+                image_features_fixed = self.prompt_learner.ZS_image_encoder(image.type(self.dtype))
+            image_features = self.image_encoder(image.type(self.dtype), visual_ctx, cross_prompts_visual_deeper)
+            teacher_cls_tokens = []
+            student_cls_tokens = []
+
+        image_features_fixed = image_features_fixed / image_features_fixed.norm(dim=-1, keepdim=True)
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         image_features = image_features + image_features_fixed
@@ -388,6 +506,21 @@ class CustomCLIP(nn.Module):
             score = cos(image_features, image_features_fixed)
             loss_distill_image = 1.0 - torch.mean(score)
             loss_distill = loss_distill_text + loss_distill_image
+
+            if self.use_cls_layer_distill:
+                matched_student, matched_teacher = self._match_layer_tokens(
+                    student_cls_tokens, teacher_cls_tokens
+                )
+                if len(matched_student) > 0:
+                    student_cls = torch.stack(matched_student, dim=1)
+                    teacher_cls = torch.stack(matched_teacher, dim=1)
+                    student_cls = self.prompt_learner.cls_distill_proj(student_cls)
+                    student_cls = student_cls / student_cls.norm(dim=-1, keepdim=True)
+                    teacher_cls = teacher_cls / teacher_cls.norm(dim=-1, keepdim=True)
+                    score = F.cosine_similarity(student_cls, teacher_cls, dim=-1, eps=1e-07)
+                    loss_distill_cls = 1.0 - torch.mean(score)
+                    loss_distill = loss_distill + self.cls_layer_distill_weight * loss_distill_cls
+
             return loss_cls + self.lambd * loss_distill
         return logits
 

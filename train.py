@@ -143,6 +143,8 @@ def extend_cfg(cfg):
     cfg.TRAINER.HICROPL.PROMPT_DEPTH = 9  # Max 12, minimum 0, for 1 it will act as shallow HICROPL (J=1)
     cfg.TRAINER.HICROPL.TEACHER_NAME = "ViT-L/14"
     cfg.TRAINER.HICROPL.LAMBD = 10.
+    cfg.TRAINER.HICROPL.USE_CLS_LAYER_DISTILL = False
+    cfg.TRAINER.HICROPL.CLS_LAYER_DISTILL_WEIGHT = 1.0
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
 
 
