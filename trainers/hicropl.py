@@ -39,8 +39,57 @@ CoPrompt_dataset_name_mapping = {
     "UCF101": "ucf101",
 }
 
+DATASET_SPECIFIC_TEMPLATES = {
+    "EuroSAT": [
+        "a satellite image of {}.",
+        "a remote sensing image of {}.",
+        "an aerial view of {}.",
+        "a top-down satellite photo of {}.",
+        "a multispectral image of {}.",
+        "a geospatial image of {}.",
+        "a land-use satellite image of {}.",
+        "a satellite patch of {}.",
+    ],
+}
+
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+
+
+def _unique_keep_order(items):
+    unique_items = []
+    seen = set()
+    for item in items:
+        if item in seen:
+            continue
+        unique_items.append(item)
+        seen.add(item)
+    return unique_items
+
+
+def get_diverse_templates(dataset_name, num_templates):
+    templates = []
+    templates.extend(DATASET_SPECIFIC_TEMPLATES.get(dataset_name, []))
+    templates.extend(IMAGENET_TEMPLATES)
+    templates = _unique_keep_order(templates)
+    return templates[:num_templates]
+
+
+def build_template_text_features(classnames, templates, clip_model):
+    classnames = [name.replace("_", " ") for name in classnames]
+
+    with torch.no_grad():
+        device = next(clip_model.parameters()).device
+        template_features = []
+        for template in templates:
+            texts = clip.tokenize([template.format(name) for name in classnames]).to(device)
+            class_embeddings = clip_model.encode_text(texts)
+            class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+            template_features.append(class_embeddings)
+
+        template_features = torch.stack(template_features, dim=0)
+
+    return template_features
 
 def load_clip_to_cpu_teacher(cfg, zero_shot_model=False):
     backbone_name = cfg.TRAINER.HICROPL.TEACHER_NAME
@@ -175,6 +224,7 @@ class CrossModalPromptLearner(nn.Module):
         cfg_imsize = cfg.INPUT.SIZE[0]
         self.cross_prompts_depth = cfg.TRAINER.HICROPL.PROMPT_DEPTH
         self.cross_layer = cfg.TRAINER.HICROPL.CROSS_LAYER
+        self.use_template_mcc = cfg.TRAINER.HICROPL.USE_TEMPLATE_MCC
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         ######## cross-modal text token initialization ########
@@ -242,6 +292,19 @@ class CrossModalPromptLearner(nn.Module):
             classnames, gpt3_prompt, clip_model_temp, cfg.DATASET.NAME
         )
         self.fixed_embeddings = clip_weights
+        if self.use_template_mcc:
+            template_strings = get_diverse_templates(
+                cfg.DATASET.NAME, cfg.TRAINER.HICROPL.TEMPLATE_NUM
+            )
+            print(f"Using {len(template_strings)} diverse text templates for MCC")
+            template_text_features = build_template_text_features(
+                classnames, template_strings, clip_model_temp
+            )
+            self.register_buffer("template_text_features", template_text_features)
+            self.template_strings = template_strings
+        else:
+            self.register_buffer("template_text_features", torch.empty(0))
+            self.template_strings = []
         ######## preparation for distillation end ########
 
         classnames = [name.replace("_", " ") for name in classnames]
@@ -356,6 +419,38 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
         self.lambd = cfg.TRAINER.HICROPL.LAMBD
+        self.use_template_mcc = cfg.TRAINER.HICROPL.USE_TEMPLATE_MCC
+        self.template_mcc_weight = cfg.TRAINER.HICROPL.TEMPLATE_MCC_WEIGHT
+        self.template_topk = cfg.TRAINER.HICROPL.TEMPLATE_TOPK
+        self.template_logit_alpha = cfg.TRAINER.HICROPL.TEMPLATE_LOGIT_ALPHA
+
+    def _compute_template_guidance(self, image_features, logit_scale):
+        template_text_features = self.prompt_learner.template_text_features
+        if template_text_features.numel() == 0:
+            return None, None, None
+
+        template_text_features = template_text_features.to(
+            device=image_features.device, dtype=image_features.dtype
+        )
+        template_logits = logit_scale * torch.einsum(
+            "bd,tcd->btc", image_features, template_text_features
+        )
+        template_probs = F.softmax(template_logits.float(), dim=-1)
+        template_entropy = -(
+            template_probs * torch.log(template_probs.clamp_min(1e-8))
+        ).sum(dim=-1)
+
+        topk = min(self.template_topk, template_logits.shape[1])
+        topk_indices = template_entropy.topk(topk, dim=1, largest=False).indices
+        gather_index = topk_indices.unsqueeze(-1).expand(-1, -1, template_logits.shape[-1])
+
+        selected_logits = template_logits.gather(1, gather_index)
+        selected_probs = template_probs.gather(1, gather_index)
+        mean_probs = selected_probs.mean(dim=1)
+        mean_probs = mean_probs / mean_probs.sum(dim=-1, keepdim=True)
+        fused_template_logits = selected_logits.mean(dim=1)
+
+        return fused_template_logits, selected_logits, mean_probs
 
     def forward(self, image, label=None):
         tokenized_prompts = self.tokenized_prompts
@@ -378,6 +473,15 @@ class CustomCLIP(nn.Module):
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         # prompted logits
         logits = logit_scale * image_features @ text_features.t()
+        selected_template_logits = None
+        template_mean_probs = None
+
+        if self.use_template_mcc:
+            template_logits, selected_template_logits, template_mean_probs = self._compute_template_guidance(
+                image_features, logit_scale
+            )
+            if template_logits is not None:
+                logits = logits + self.template_logit_alpha * template_logits
 
         if self.prompt_learner.training:
             loss_cls = F.cross_entropy(logits, label)
@@ -388,7 +492,14 @@ class CustomCLIP(nn.Module):
             score = cos(image_features, image_features_fixed)
             loss_distill_image = 1.0 - torch.mean(score)
             loss_distill = loss_distill_text + loss_distill_image
-            return loss_cls + self.lambd * loss_distill
+            loss_template_mcc = image_features.new_zeros(())
+            if self.use_template_mcc and selected_template_logits is not None:
+                selected_log_probs = F.log_softmax(selected_template_logits.float(), dim=-1)
+                target_probs = template_mean_probs.unsqueeze(1).expand_as(selected_log_probs)
+                loss_template_mcc = F.kl_div(
+                    selected_log_probs, target_probs, reduction="batchmean"
+                )
+            return loss_cls + self.lambd * loss_distill + self.template_mcc_weight * loss_template_mcc
         return logits
 
 
