@@ -98,15 +98,32 @@ def load_checkpoint(fpath):
 
     map_location = None if torch.cuda.is_available() else "cpu"
 
+    def _torch_load(weights_only=None, pickle_module=None):
+        load_kwargs = {"map_location": map_location}
+        if pickle_module is not None:
+            load_kwargs["pickle_module"] = pickle_module
+        if weights_only is not None:
+            load_kwargs["weights_only"] = weights_only
+        return torch.load(fpath, **load_kwargs)
+
     try:
-        checkpoint = torch.load(fpath, map_location=map_location)
+        checkpoint = _torch_load()
+
+    except pickle.UnpicklingError:
+        # PyTorch 2.6+ changed torch.load's default to weights_only=True.
+        # Our training checkpoints can contain optimizer/scheduler objects,
+        # so we fall back to the legacy behavior for trusted local files.
+        checkpoint = _torch_load(weights_only=False)
 
     except UnicodeDecodeError:
         pickle.load = partial(pickle.load, encoding="latin1")
         pickle.Unpickler = partial(pickle.Unpickler, encoding="latin1")
-        checkpoint = torch.load(
-            fpath, pickle_module=pickle, map_location=map_location
-        )
+        try:
+            checkpoint = _torch_load(pickle_module=pickle)
+        except pickle.UnpicklingError:
+            checkpoint = _torch_load(
+                weights_only=False, pickle_module=pickle
+            )
 
     except Exception:
         print('Unable to load checkpoint from "{}"'.format(fpath))

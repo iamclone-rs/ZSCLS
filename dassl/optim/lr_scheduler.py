@@ -19,7 +19,14 @@ class _BaseWarmupScheduler(_LRScheduler):
     ):
         self.successor = successor
         self.warmup_epoch = warmup_epoch
-        super().__init__(optimizer, last_epoch, verbose)
+        try:
+            super().__init__(
+                optimizer, last_epoch=last_epoch, verbose=verbose
+            )
+        except TypeError:
+            # PyTorch versions used on Kaggle may not accept ``verbose``
+            # as a positional or keyword argument here.
+            super().__init__(optimizer, last_epoch=last_epoch)
 
     def get_lr(self):
         raise NotImplementedError
